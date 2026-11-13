@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""JETANK: D-pad driving, A recording toggle, B quit. Python 3.6+."""
+"""JETANK: left-stick analog driving, A recording toggle, B quit. Python 3.6+."""
 import argparse
 import array
 import math
@@ -76,18 +76,13 @@ class Gamepad:
     def button_index(self, name):
         return self.button_names.index(name) if name in self.button_names else None
 
-    def direction(self, h_axis, v_axis):
-        if h_axis is not None and v_axis is not None:
-            h = self.axes.get(h_axis, 0)
-            v = self.axes.get(v_axis, 0)
-        else:
-            def held(name):
-                n = self.button_index(name)
-                return int(self.buttons.get(n, False)) if n is not None else 0
-            h = held('dpad_right') - held('dpad_left')
-            v = held('dpad_down') - held('dpad_up')
-        return (1 if h > .5 else -1 if h < -.5 else 0,
-                1 if v > .5 else -1 if v < -.5 else 0)
+    def stick(self, h_axis, v_axis, threshold):
+        def clean(value):
+            if abs(value) <= threshold:
+                return 0.0
+            return math.copysign((abs(value) - threshold) / (1 - threshold), value)
+        return (clean(self.axes.get(h_axis, 0)),
+                clean(self.axes.get(v_axis, 0)))
 
     def close(self):
         os.close(self.fd)
@@ -108,8 +103,9 @@ def main():
     p.add_argument('--drive', action='store_true')
     p.add_argument('--record-button', type=int)
     p.add_argument('--quit-button', type=int)
-    p.add_argument('--dpad-x-axis', type=int)
-    p.add_argument('--dpad-y-axis', type=int)
+    p.add_argument('--steer-axis', type=int)
+    p.add_argument('--throttle-axis', type=int)
+    p.add_argument('--deadzone', type=float, default=.12)
     p.add_argument('--speed', type=float, default=.20)
     p.add_argument('--turn-speed', type=float, default=.15)
     p.add_argument('--hz', type=float, default=10)
@@ -122,6 +118,9 @@ def main():
         p.error('speed/turn-speed must be within (0, 1]')
     if not math.isfinite(a.hz) or a.hz <= 0 or min(a.width, a.height) <= 0:
         p.error('Invalid hz/width/height')
+
+    if not math.isfinite(a.deadzone) or not 0 <= a.deadzone < 1:
+        p.error('deadzone must be within [0, 1)')
 
     pad = Gamepad(a.device)
     robot = camera = callback = collector = None
@@ -147,18 +146,17 @@ def main():
             raise RuntimeError('A/B mapping missing. Inspect then set --record-button / --quit-button.')
         if rec == quit_btn or not all(0 <= n < len(pad.button_names) for n in (rec, quit_btn)):
             raise ValueError('Invalid recording/quit button indices')
-        hx = a.dpad_x_axis
-        vy = a.dpad_y_axis
-        if hx is None and vy is None and 'lr' in pad.axis_names and 'fb' in pad.axis_names:
-            hx, vy = pad.axis_names.index('lr'), pad.axis_names.index('fb')
-        if (hx is None) != (vy is None):
-            raise ValueError('Set both D-pad axes together')
-        if hx is not None:
-            if hx == vy or not all(0 <= n < len(pad.axis_names) for n in (hx, vy)):
-                raise ValueError('Invalid D-pad axis indices')
-        elif not all(n in pad.button_names for n in ('dpad_up', 'dpad_down', 'dpad_left', 'dpad_right')):
-            raise RuntimeError('No D-pad mapping. Inspect and set both --dpad-x-axis / --dpad-y-axis.')
-        print('Record button={} Quit button={} D-pad axes={}'.format(rec, quit_btn, (hx, vy)), flush=True)
+        hx = a.steer_axis
+        vy = a.throttle_axis
+        if hx is None and 'x' in pad.axis_names:
+            hx = pad.axis_names.index('x')
+        if vy is None and 'y' in pad.axis_names:
+            vy = pad.axis_names.index('y')
+        if hx is None or vy is None:
+            raise RuntimeError('No left-stick mapping. Inspect and set --steer-axis / --throttle-axis.')
+        if hx == vy or not all(0 <= n < len(pad.axis_names) for n in (hx, vy)):
+            raise ValueError('Invalid joystick axis indices')
+        print('Record button={} Quit button={} Left-stick axes={}'.format(rec, quit_btn, (hx, vy)), flush=True)
 
         from jetbot import Camera
         if a.drive:
@@ -201,7 +199,7 @@ def main():
         camera.observe(callback, names='value')
         apply(0, 0, force=True)
         print('MODE: {} | Recording OFF'.format('REAL MOTORS' if a.drive else 'DRY-RUN'), flush=True)
-        print('Center D-pad once. A: record toggle, B: quit, Ctrl+C: quit.', flush=True)
+        print('Center left stick once. A: record toggle, B: quit, Ctrl+C: quit.', flush=True)
         centered = False
         started = time.monotonic()
         report = 0
@@ -219,8 +217,8 @@ def main():
             if last_frame is None and now - started > 10:
                 raise RuntimeError('No new camera frames')
             fresh = last_frame is not None and now - last_frame < 1.0
-            h, v = pad.direction(hx, vy)
-            if h == 0 and v == 0:
+            h, v = pad.stick(hx, vy, a.deadzone)
+            if hx in pad.axes and vy in pad.axes and h == 0 and v == 0:
                 centered = True
             if not fresh:
                 centered = False
@@ -248,7 +246,7 @@ def main():
                 left, right = 0, 0
             apply(left, right)
             if now - report >= 1:
-                print('D-pad=({}, {}) L={:+.2f} R={:+.2f} recording={} saved={}'.format(
+                print('Stick=({:+.2f}, {:+.2f}) L={:+.2f} R={:+.2f} recording={} saved={}'.format(
                     h, v, left, right, collector is not None, collector.saved if collector else 0), flush=True)
                 report = now
             time.sleep(.01)
